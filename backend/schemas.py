@@ -4,6 +4,7 @@ from typing import List, Optional
 
 class AskRequest(BaseModel):
     query: str
+    session_id: Optional[str] = None
 
 
 class BuildDBRequest(BaseModel):

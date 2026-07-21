@@ -11,7 +11,7 @@ import threading
 
 from langchain_community.vectorstores import FAISS
 
-from core.llm import chat_model
+from core.llm import chat_model, stream_chat_model
 from core.prompt import prompt_builder
 from core.vector_store import get_embedding_model, VECTOR_DB_PATH
 
@@ -51,8 +51,9 @@ def load_reranker():
             model_path = local_model
             print(f"使用本地Reranker: {model_path}")
         else:
-            model_path = "BAAI/bge-reranker-base"
-            print("本地模型不存在，使用在线模型")
+            # 禁止静默联网下载：模型缺失时跳过重排序（走检索顺序兜底）
+            print(f"本地Reranker模型不存在: {local_model}，跳过重排序。请先运行 python download_models.py")
+            return None
         
         _reranker = FlagReranker(
             model_path,
@@ -255,6 +256,64 @@ def is_obvious_general_query(query: str) -> bool:
     return any(re.search(p, q) for p in GENERAL_QUERY_PATTERNS)
 
 
+# ============================================
+# 多轮对话：查询改写（指代/省略补全）
+# ============================================
+
+# 含指代或省略特征的问题才需要改写，避免对所有问题多调一次 LLM
+REWRITE_HINT_PATTERNS = [
+    r"(它|他|她|这个|那个|该|此|上述|前面|前者|后者)",
+    r"(步骤|方法|流程|原因|结果|结论|时间|地点|目的|材料|原理|内容)呢[？?]?$",
+    r"^(还有|然后|那么|那|继续|再)",
+]
+
+
+def needs_rewrite(query: str) -> bool:
+    """粗判问题是否含指代/省略，需要结合历史改写"""
+    q = query.strip()
+    if any(re.search(p, q) for p in REWRITE_HINT_PATTERNS):
+        return True
+    # 极短追问（如「步骤呢」「为什么」）大概率依赖上文
+    if len(q) <= 6:
+        return True
+    return False
+
+
+def rewrite_query(query: str, history: list) -> str:
+    """
+    结合最近对话历史，把含指代/省略的问题改写为可独立检索的完整问题。
+    改写失败或结果异常时回退为原问题。
+    """
+    if not history:
+        return query
+
+    history_text = "\n".join(
+        f"用户：{h.get('question', '')}\n助手：{h.get('answer', '')[:200]}"
+        for h in history[-3:]
+    )
+    prompt = f"""以下是一段对话历史和用户的最新问题。如果最新问题包含指代（如"它""这个"）或省略了主语，请结合历史将其改写为语义完整、可独立理解的问题；如果问题本身已经完整，请原样返回该问题。只输出改写后的问题本身，不要输出任何解释或回答。
+
+对话历史：
+{history_text}
+
+最新问题：{query}
+改写后的问题："""
+
+    try:
+        rewritten = chat_model(prompt).strip()
+        # 去掉可能的引号包裹
+        rewritten = rewritten.strip("「」\"'")
+        if not rewritten or len(rewritten) > max(len(query) * 4, 200):
+            print(f"查询改写结果异常，回退原问题: {rewritten[:80]}")
+            return query
+        if rewritten != query:
+            print(f"【查询改写】「{query}」->「{rewritten}」")
+        return rewritten
+    except Exception as e:
+        print(f"查询改写失败，使用原问题: {e}")
+        return query
+
+
 def _kb_miss_response() -> dict:
     return {
         "answer": KB_MISS_ANSWER,
@@ -264,9 +323,9 @@ def _kb_miss_response() -> dict:
     }
 
 
-def _general_llm_response(query: str) -> dict:
+def _general_llm_response(query: str, history=None) -> dict:
     print("\n【通用模式】问题与知识库无关，直接调用 LLM（不引用来源）")
-    response = _call_llm_direct(query)
+    response = _call_llm_direct(query, history=history)
     return {
         "answer": response,
         "sources": [],
@@ -336,11 +395,11 @@ def rerank(query: str, docs: list, top_n: int = 3) -> tuple:
     return filtered, best_score
 
 
-def _call_llm_direct(query: str) -> str:
+def _call_llm_direct(query: str, history=None) -> str:
     """不基于知识库，直接调用 LLM"""
     _reset_reranker()
     try:
-        return chat_model(query)
+        return chat_model(query, history=history)
     except Exception as e:
         print(f"LLM 调用失败: {e}")
         import traceback
@@ -350,56 +409,77 @@ def _call_llm_direct(query: str) -> str:
             "请确认后端终端仍在运行，并重启 uvicorn 后重试。"
         )
 
+
+def _stream_llm_direct(query: str, history=None):
+    """流式调用 LLM；流式失败时回退为一次性非流式输出"""
+    _reset_reranker()
+    try:
+        yield from stream_chat_model(query, history=history)
+    except Exception as e:
+        print(f"LLM 流式调用失败，回退非流式: {e}")
+        yield _call_llm_direct(query, history=history)
+
 # ============================================
-# 主问答函数
+# 检索管线（ask / ask_stream 共用）
 # ============================================
 
-def ask(query: str, use_reranker: bool = True) -> dict:
+def _prepare_context(query: str, history=None, use_reranker: bool = True) -> dict:
     """
-    主问答函数
-    
-    Args:
-        query: 用户问题
-        use_reranker: 是否使用Reranker
-    
+    执行 闲聊/通用判断 -> 查询改写 -> 检索 -> 重排序 -> 构建Prompt。
+
     Returns:
-        dict: {answer, sources, context_length, retrieved_docs}
+        dict: {
+            mode: 'rag' | 'general' | 'kb_miss',
+            prompt: RAG prompt（mode='rag' 时）,
+            sources, context_length, retrieved_docs,
+            effective_query: 改写后的检索用问题,
+        }
     """
-    global _reranker
     print(f"\n===== 问题: {query} =====")
 
     if is_chitchat_query(query):
         print("\n【闲聊模式】直接调用LLM")
-        return _general_llm_response(query)
+        return {"mode": "general", "sources": [], "context_length": 0,
+                "retrieved_docs": 0, "effective_query": query}
 
     if is_obvious_general_query(query):
         print("\n【通用模式】识别为编程/通用问题，跳过知识库检索")
-        return _general_llm_response(query)
-    
+        return {"mode": "general", "sources": [], "context_length": 0,
+                "retrieved_docs": 0, "effective_query": query}
+
+    # 0. 多轮对话：含指代/省略时先改写为独立问题再检索
+    effective_query = query
+    if history and needs_rewrite(query):
+        print("\n【步骤0】检测到指代/省略，结合历史改写问题...")
+        effective_query = rewrite_query(query, history)
+
     # 1. 检索文档
     print("\n【步骤1】检索文档...")
-    raw_docs = retrieve(query)
+    raw_docs = retrieve(effective_query)
     print(f"检索到 {len(raw_docs)} 个文档")
-    
+
     # 2. Reranker重排序
     rerank_best_score = None
     if use_reranker:
         print("\n【步骤2】Reranker重排序...")
-        docs, rerank_best_score = rerank(query, raw_docs)
+        docs, rerank_best_score = rerank(effective_query, raw_docs)
         print(f"重排序后保留 {len(docs)} 个文档")
     else:
         docs = raw_docs
-    
+
     # 3. 无相关文档：区分「知识库缺答案」与「通用问题」
     if not docs:
-        if experiment_query_mismatch(query, raw_docs):
+        if experiment_query_mismatch(effective_query, raw_docs):
             print("\n【知识库无匹配】实验编号不匹配，返回标准拒答")
-            return _kb_miss_response()
+            return {"mode": "kb_miss", "sources": [], "context_length": 0,
+                    "retrieved_docs": 0, "effective_query": effective_query}
         if rerank_best_score is not None and rerank_best_score < GENERAL_LLM_MAX_SCORE:
-            return _general_llm_response(query)
+            return {"mode": "general", "sources": [], "context_length": 0,
+                    "retrieved_docs": 0, "effective_query": effective_query}
         print("\n【知识库无匹配】与知识库主题相近但无答案，返回标准拒答")
-        return _kb_miss_response()
-    
+        return {"mode": "kb_miss", "sources": [], "context_length": 0,
+                "retrieved_docs": 0, "effective_query": effective_query}
+
     # 4. 输出检索结果（调试）
     print("\n【步骤3】检索结果详情：")
     for i, doc in enumerate(docs):
@@ -409,29 +489,91 @@ def ask(query: str, use_reranker: bool = True) -> dict:
         print(f"\n【文档 {i+1}】{source} (P{page} Chunk{chunk_id})")
         print(f"内容预览：{doc.page_content[:150]}...")
         print("-" * 60)
-    
+
     # 5. 构建Prompt（使用统一的PromptBuilder）
     print("\n【步骤4】构建Prompt...")
-    prompt_result = prompt_builder.build_rag_prompt(query, docs)
-    prompt = prompt_result["prompt"]
-    sources = prompt_result["sources"]
-    context_length = prompt_result["context_length"]
-    print(f"上下文长度: {context_length} 字符")
-    
+    prompt_result = prompt_builder.build_rag_prompt(effective_query, docs)
+    print(f"上下文长度: {prompt_result['context_length']} 字符")
+
+    return {
+        "mode": "rag",
+        "prompt": prompt_result["prompt"],
+        "sources": prompt_result["sources"],
+        "context_length": prompt_result["context_length"],
+        "retrieved_docs": len(docs),
+        "effective_query": effective_query,
+    }
+
+
+# ============================================
+# 主问答函数
+# ============================================
+
+def ask(query: str, use_reranker: bool = True, history=None) -> dict:
+    """
+    主问答函数
+
+    Args:
+        query: 用户问题
+        use_reranker: 是否使用Reranker
+        history: 多轮对话历史（[{question, answer}]，最近几轮）
+
+    Returns:
+        dict: {answer, sources, context_length, retrieved_docs}
+    """
+    ctx = _prepare_context(query, history=history, use_reranker=use_reranker)
+
+    if ctx["mode"] == "kb_miss":
+        return _kb_miss_response()
+
+    if ctx["mode"] == "general":
+        return _general_llm_response(query, history=history)
+
     # 5. 调用LLM（释放 Reranker 占用的显存）
     print("\n【步骤5】调用LLM...")
-    print("=== 进入LLM调用前 ===")
-    response = _call_llm_direct(prompt)
-    
-    print("=== 回答完成 ===")
-    
+    response = _call_llm_direct(ctx["prompt"], history=history)
+
     print("\n【步骤6】回答完成！")
-    
+
     return {
         "answer": response,
-        "sources": sources,
-        "context_length": context_length,
-        "retrieved_docs": len(docs)
+        "sources": ctx["sources"],
+        "context_length": ctx["context_length"],
+        "retrieved_docs": ctx["retrieved_docs"]
+    }
+
+
+def ask_stream(query: str, history=None, use_reranker: bool = True):
+    """
+    流式问答生成器：检索/重排序完成后逐 token 输出。
+
+    Yields:
+        dict: {"type": "token", "text": 增量文本}
+              或结束事件 {"type": "end", "sources", "context_length", "retrieved_docs"}
+    """
+    ctx = _prepare_context(query, history=history, use_reranker=use_reranker)
+
+    if ctx["mode"] == "kb_miss":
+        yield {"type": "token", "text": KB_MISS_ANSWER}
+        yield {"type": "end", "sources": [], "context_length": 0, "retrieved_docs": 0}
+        return
+
+    if ctx["mode"] == "general":
+        for delta in _stream_llm_direct(query, history=history):
+            yield {"type": "token", "text": delta}
+        yield {"type": "end", "sources": [], "context_length": 0, "retrieved_docs": 0}
+        return
+
+    print("\n【步骤5】流式调用LLM...")
+    for delta in _stream_llm_direct(ctx["prompt"], history=history):
+        yield {"type": "token", "text": delta}
+
+    print("\n【步骤6】回答完成！")
+    yield {
+        "type": "end",
+        "sources": ctx["sources"],
+        "context_length": ctx["context_length"],
+        "retrieved_docs": ctx["retrieved_docs"],
     }
 
 

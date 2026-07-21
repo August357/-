@@ -36,6 +36,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS chat_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
+            session_id TEXT,
             question TEXT NOT NULL,
             answer TEXT NOT NULL,
             sources TEXT,
@@ -43,6 +44,12 @@ def init_db():
             FOREIGN KEY (user_id) REFERENCES users(id)
         )
     """)
+
+    # 旧库迁移：补充 session_id 列
+    cursor.execute("PRAGMA table_info(chat_history)")
+    columns = {row[1] for row in cursor.fetchall()}
+    if "session_id" not in columns:
+        cursor.execute("ALTER TABLE chat_history ADD COLUMN session_id TEXT")
 
     conn.commit()
     conn.close()

@@ -6,14 +6,16 @@ from fastapi import (
     HTTPException
 )
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+import json
 import shutil
 import os
 
 from backend.schemas import AskRequest, BuildDBRequest, RegisterRequest, LoginRequest
 from backend.system_api import get_system_info
-from backend.auth import register_user, authenticate_user, create_access_token, get_current_user, save_chat_history, get_chat_history
+from backend.auth import register_user, authenticate_user, create_access_token, get_current_user, save_chat_history, get_chat_history, get_session_history
 from backend.database import get_db
-from core.qa_chain import ask
+from core.qa_chain import ask, ask_stream
 from core.llm import load_model
 from core.vector_store import (
     build_vector_db,
@@ -106,13 +108,18 @@ def ask_api(
     current_user: dict = Depends(get_current_user)
 ):
     try:
-        result = ask(req.query)
+        history = get_session_history(
+            current_user["user_id"], req.session_id, limit=3
+        ) if req.session_id else []
+
+        result = ask(req.query, history=history)
 
         save_chat_history(
             user_id=current_user["user_id"],
             question=req.query,
             answer=result.get("answer", ""),
-            sources=result.get("sources", [])
+            sources=result.get("sources", []),
+            session_id=req.session_id
         )
 
         return result
@@ -130,6 +137,57 @@ def ask_api(
             status_code=500,
             detail=str(e)
         )
+
+
+# ==========================
+# 流式问答接口（SSE）
+# ==========================
+
+@app.post("/api/ask/stream")
+def ask_stream_api(
+    req: AskRequest,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    SSE 流式问答：逐 token 推送 {"type":"token","text":...}，
+    末尾推送 {"type":"end","sources":...} 事件后发送 [DONE]。
+    """
+    history = get_session_history(
+        current_user["user_id"], req.session_id, limit=3
+    ) if req.session_id else []
+
+    def event_gen():
+        full_answer = ""
+        final_sources = []
+        try:
+            for event in ask_stream(req.query, history=history):
+                if event.get("type") == "token":
+                    full_answer += event.get("text", "")
+                elif event.get("type") == "end":
+                    final_sources = event.get("sources", [])
+                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+            save_chat_history(
+                user_id=current_user["user_id"],
+                question=req.query,
+                answer=full_answer,
+                sources=final_sources,
+                session_id=req.session_id
+            )
+            yield "data: [DONE]\n\n"
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            yield f"data: {json.dumps({'type': 'error', 'detail': str(e)}, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        event_gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        }
+    )
 
 
 # ==========================

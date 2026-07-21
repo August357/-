@@ -60,6 +60,12 @@ _embedding_model = None
 def get_embedding_model():
     global _embedding_model
     if _embedding_model is None:
+        # 本地模型缺失时立即报错，避免 sentence-transformers 静默联网下载导致请求挂起
+        if not os.path.exists(EMBEDDING_MODEL_PATH):
+            raise FileNotFoundError(
+                f"Embedding模型目录不存在: {EMBEDDING_MODEL_PATH}。"
+                "请先运行 python download_models.py 下载模型。"
+            )
         print("正在加载Embedding模型...")
         _embedding_model = HuggingFaceEmbeddings(
             model_name=EMBEDDING_MODEL_PATH,

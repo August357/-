@@ -133,17 +133,18 @@ def authenticate_user(username: str, password: str) -> Optional[dict]:
         conn.close()
 
 
-def save_chat_history(user_id: int, question: str, answer: str, sources: list = None) -> bool:
+def save_chat_history(user_id: int, question: str, answer: str, sources: list = None, session_id: str = None) -> bool:
     """保存聊天记录"""
     conn = get_db()
     cursor = conn.cursor()
 
     try:
         cursor.execute(
-            """INSERT INTO chat_history (user_id, question, answer, sources)
-               VALUES (?, ?, ?, ?)""",
+            """INSERT INTO chat_history (user_id, session_id, question, answer, sources)
+               VALUES (?, ?, ?, ?, ?)""",
             (
                 user_id,
+                session_id,
                 question,
                 answer,
                 json.dumps(sources, ensure_ascii=False) if sources is not None else None
@@ -154,6 +155,32 @@ def save_chat_history(user_id: int, question: str, answer: str, sources: list = 
     except Exception as e:
         conn.rollback()
         return False
+    finally:
+        conn.close()
+
+
+def get_session_history(user_id: int, session_id: str, limit: int = 3) -> list:
+    """
+    获取指定会话最近 limit 轮对话，按时间正序返回，
+    用于拼入 LLM 的 history（多轮对话）。
+    """
+    if not session_id:
+        return []
+    conn = get_db()
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute(
+            """SELECT question, answer
+               FROM chat_history
+               WHERE user_id = ? AND session_id = ?
+               ORDER BY create_time DESC, id DESC
+               LIMIT ?""",
+            (user_id, session_id, limit)
+        )
+        rows = cursor.fetchall()
+        rows.reverse()  # 恢复时间正序
+        return [{"question": row["question"], "answer": row["answer"]} for row in rows]
     finally:
         conn.close()
 

@@ -113,7 +113,7 @@ import { ElMessage } from "element-plus";
 import MainLayout
 from "../layouts/MainLayout.vue";
 
-import { askQuestion }
+import { askQuestion, askQuestionStream }
 from "../api/chat";
 
 import { getChatHistory }
@@ -125,6 +125,12 @@ const loading = ref(false);
 const exporting = ref(false);
 
 const messages = ref([]);
+
+// 每次进入页面生成一个会话ID，同一页面内的追问属于同一 session（多轮对话）
+const sessionId = ref(
+  (crypto.randomUUID && crypto.randomUUID()) ||
+  `s_${Date.now()}_${Math.random().toString(36).slice(2)}`
+);
 
 const formatExportFilename = () => {
   const now = new Date();
@@ -290,21 +296,40 @@ const exportPDF = async () => {
   }
 };
 
-// 打字机效果
-const typeWriter = (msg, text) => {
-  let index = 0;
+// 流式请求封装：真实 SSE 渲染，失败时降级为非流式接口
+const streamAnswer = async (msg, query) => {
+  msg.content = "";
   msg.displayContent = "";
+  msg.sources = null;
 
-  const timer = setInterval(() => {
-    if (index < text.length) {
-      msg.displayContent += text[index];
-      index++;
-    } else {
-      clearInterval(timer);
-    }
-  }, 20);
+  let streamFailed = false;
 
-  return timer;
+  try {
+    await askQuestionStream(query, sessionId.value, {
+      onToken: (text) => {
+        msg.content += text;
+        msg.displayContent = msg.content;
+      },
+      onSources: (sources) => {
+        msg.sources = sources;
+      },
+      onError: (err) => {
+        streamFailed = true;
+        console.warn("SSE 错误事件:", err);
+      }
+    });
+  } catch (e) {
+    streamFailed = true;
+    console.warn("流式请求失败，尝试非流式降级:", e);
+  }
+
+  // 降级：流式失败且没有任何输出时走原非流式接口
+  if (streamFailed && !msg.content) {
+    const res = await askQuestion(query, sessionId.value);
+    msg.content = res.data.answer;
+    msg.displayContent = res.data.answer;
+    msg.sources = res.data.sources;
+  }
 };
 
 // 重新生成
@@ -318,16 +343,9 @@ const retry = async (msg) => {
 
   // 标记加载状态
   msg.loading = true;
-  msg.displayContent = "";
 
   try {
-    const res = await askQuestion(userMsg.content);
-
-    msg.content = res.data.answer;
-    msg.sources = res.data.sources;
-
-    // 打字机效果
-    typeWriter(msg, res.data.answer);
+    await streamAnswer(msg, userMsg.content);
   } catch (e) {
     msg.content = "请求失败";
     msg.displayContent = "请求失败";
@@ -352,31 +370,24 @@ question.value = "";
 
 loading.value = true;
 
-try {
-
-const res = await askQuestion(q);
-
 const aiMsg = {
 role: "ai",
-content: res.data.answer,
-sources: res.data.sources,
+content: "",
+sources: null,
 displayContent: "",
 loading: false
 };
 
 messages.value.push(aiMsg);
 
-// 打字机效果
-typeWriter(aiMsg, res.data.answer);
+try {
+
+await streamAnswer(aiMsg, q);
 
 } catch (e) {
 
-messages.value.push({
-role: "ai",
-content: "请求失败",
-displayContent: "请求失败",
-loading: false
-});
+aiMsg.content = "请求失败";
+aiMsg.displayContent = "请求失败";
 
 }
 

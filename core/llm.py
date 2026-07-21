@@ -93,9 +93,43 @@ def load_model():
     return _model, _tokenizer
 
 
-def chat_model(query: str, max_new_tokens: int = MAX_NEW_TOKENS) -> str:
+# 多轮对话 history 的安全上限：最多 3 轮，每条内容截断，避免撑爆显存
+MAX_HISTORY_ROUNDS = 3
+MAX_HISTORY_CHARS = 800
+
+
+def _normalize_history(history) -> list:
+    """
+    将 [{'question':..., 'answer':...}] 或 ChatGLM 格式的 history
+    统一为 ChatGLM3 的 [{'role': 'user'/'assistant', 'content': ...}] 列表，
+    只保留最近 MAX_HISTORY_ROUNDS 轮并截断过长内容。
+    """
+    if not history:
+        return []
+
+    messages = []
+    for item in history:
+        if isinstance(item, dict) and "role" in item:
+            messages.append({"role": item["role"], "content": str(item.get("content", ""))})
+        elif isinstance(item, dict):
+            messages.append({"role": "user", "content": str(item.get("question", ""))})
+            messages.append({"role": "assistant", "content": str(item.get("answer", ""))})
+        elif isinstance(item, (list, tuple)) and len(item) == 2:
+            messages.append({"role": "user", "content": str(item[0])})
+            messages.append({"role": "assistant", "content": str(item[1])})
+
+    messages = messages[-MAX_HISTORY_ROUNDS * 2:]
+    return [
+        {"role": m["role"], "content": m["content"][:MAX_HISTORY_CHARS]}
+        for m in messages
+        if m["content"].strip()
+    ]
+
+
+def chat_model(query: str, max_new_tokens: int = MAX_NEW_TOKENS, history=None) -> str:
     """
     线程安全、限长推理，防止 max_length=8192 撑爆 8GB 显存导致进程被系统杀死。
+    history 为多轮对话上下文（ChatGLM3 格式或 [{question, answer}]）。
     """
     text = (query or "").strip()
     if not text:
@@ -104,29 +138,77 @@ def chat_model(query: str, max_new_tokens: int = MAX_NEW_TOKENS) -> str:
     if len(text) > MAX_INPUT_CHARS:
         text = text[:MAX_INPUT_CHARS] + "\n...(输入过长已截断)"
 
+    chat_history = _normalize_history(history)
+
+    # 注意：load_model 内部会获取 _lock，必须在持锁前调用，避免同线程重入死锁
+    model, tokenizer = load_model()
+
     with _lock:
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        model, tokenizer = load_model()
-
-        inputs = tokenizer.build_chat_input(text, history=[], role="user")
+        inputs = tokenizer.build_chat_input(text, history=chat_history, role="user")
         input_len = int(inputs["input_ids"].shape[1])
         max_length = min(input_len + max_new_tokens, MAX_TOTAL_TOKENS)
         if max_length <= input_len:
             max_length = min(input_len + 128, MAX_TOTAL_TOKENS)
 
-        print(f"LLM 推理: input_tokens≈{input_len}, max_length={max_length}")
+        print(f"LLM 推理: input_tokens≈{input_len}, max_length={max_length}, history轮数={len(chat_history)//2}")
 
         response, _ = model.chat(
             tokenizer,
             text,
-            history=[],
+            history=chat_history,
             max_length=max_length,
             do_sample=False,
         )
         return response
+
+
+def stream_chat_model(query: str, history=None, max_new_tokens: int = MAX_NEW_TOKENS):
+    """
+    流式推理：逐 token 增量 yield 新生成的文本。
+    基于 ChatGLM3 的 model.stream_chat（其输出为累积文本，此处转为增量）。
+    """
+    text = (query or "").strip()
+    if not text:
+        yield "请输入有效问题。"
+        return
+
+    if len(text) > MAX_INPUT_CHARS:
+        text = text[:MAX_INPUT_CHARS] + "\n...(输入过长已截断)"
+
+    chat_history = _normalize_history(history)
+
+    # 注意：load_model 内部会获取 _lock，必须在持锁前调用，避免同线程重入死锁
+    model, tokenizer = load_model()
+
+    with _lock:
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        inputs = tokenizer.build_chat_input(text, history=chat_history, role="user")
+        input_len = int(inputs["input_ids"].shape[1])
+        max_length = min(input_len + max_new_tokens, MAX_TOTAL_TOKENS)
+        if max_length <= input_len:
+            max_length = min(input_len + 128, MAX_TOTAL_TOKENS)
+
+        print(f"LLM 流式推理: input_tokens≈{input_len}, max_length={max_length}, history轮数={len(chat_history)//2}")
+
+        past = ""
+        for response, _ in model.stream_chat(
+            tokenizer,
+            text,
+            history=chat_history,
+            max_length=max_length,
+            do_sample=False,
+        ):
+            delta = response[len(past):]
+            past = response
+            if delta:
+                yield delta
 
 
 def test_model():
