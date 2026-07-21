@@ -5,8 +5,11 @@
 | 用途 | HuggingFace 仓库 | 本地路径 |
 |------|------------------|----------|
 | 大语言模型 | [THUDM/chatglm3-6b](https://huggingface.co/THUDM/chatglm3-6b) | `models/chatglm3-6b/` |
-| 文本嵌入 | [BAAI/bge-small-zh-v1.5](https://huggingface.co/BAAI/bge-small-zh-v1.5) | `models/bge-small-zh-v1.5/` |
+| 文本嵌入 | [BAAI/bge-large-zh-v1.5](https://huggingface.co/BAAI/bge-large-zh-v1.5) | `models/bge-large-zh-v1.5/` |
 | 重排序 | [BAAI/bge-reranker-base](https://huggingface.co/BAAI/bge-reranker-base) | `models/bge-reranker-base/` |
+
+> 注意：Embedding 模型已从 bge-small-zh-v1.5 升级为 bge-large-zh-v1.5。
+> 更换模型后旧向量库不兼容，下载完成后**必须重建向量库**（见下文第 2 步）。
 
 ## 下载方式
 
@@ -23,7 +26,7 @@ python download_models.py
 
 ```bash
 huggingface-cli download THUDM/chatglm3-6b --local-dir models/chatglm3-6b
-huggingface-cli download BAAI/bge-small-zh-v1.5 --local-dir models/bge-small-zh-v1.5
+huggingface-cli download BAAI/bge-large-zh-v1.5 --local-dir models/bge-large-zh-v1.5
 huggingface-cli download BAAI/bge-reranker-base --local-dir models/bge-reranker-base
 ```
 

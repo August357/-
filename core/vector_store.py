@@ -1,6 +1,7 @@
 import os
-import torch
+import re
 import shutil
+import logging
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
@@ -12,6 +13,8 @@ from langchain_community.document_loaders import (
 from langchain_community.vectorstores import FAISS
 
 from langchain_huggingface import HuggingFaceEmbeddings
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================
@@ -34,7 +37,8 @@ CHUNK_INFO_PATH = os.path.join(
 )
 
 # Embedding模型配置
-EMBEDDING_MODEL_NAME = "bge-small-zh-v1.5"
+# 注意：更换模型后必须重建向量库（向量维度/分布不同，旧 index.faiss 不兼容）
+EMBEDDING_MODEL_NAME = "bge-large-zh-v1.5"
 EMBEDDING_MODEL_PATH = os.path.join(BASE_DIR, "models", EMBEDDING_MODEL_NAME)
 
 # ============================================
@@ -66,13 +70,13 @@ def get_embedding_model():
                 f"Embedding模型目录不存在: {EMBEDDING_MODEL_PATH}。"
                 "请先运行 python download_models.py 下载模型。"
             )
-        print("正在加载Embedding模型...")
+        logger.info("正在加载Embedding模型...")
         _embedding_model = HuggingFaceEmbeddings(
             model_name=EMBEDDING_MODEL_PATH,
             model_kwargs={"device": DEVICE},
             encode_kwargs={"normalize_embeddings": True},
         )
-        print("Embedding模型加载成功！")
+        logger.info("Embedding模型加载成功！")
     return _embedding_model
 
 
@@ -95,12 +99,12 @@ embedding_model = _EmbeddingProxy()
 def create_splitter(chunk_size=500, chunk_overlap=100, split_mode="zh"):
     """
     根据配置动态创建文本切分器
-    
+
     Args:
         chunk_size: Chunk大小
         chunk_overlap: Chunk重叠大小
         split_mode: 切分策略（zh/paragraph/sentence）
-    
+
     Returns:
         RecursiveCharacterTextSplitter: 文本切分器
     """
@@ -111,7 +115,7 @@ def create_splitter(chunk_size=500, chunk_overlap=100, split_mode="zh"):
         separators = ["。", "！", "？", "；"]
     else:  # zh - 中文智能切分
         separators = ["\n\n", "\n", "。", "！", "？", "；", "，"]
-    
+
     return RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
@@ -121,6 +125,53 @@ def create_splitter(chunk_size=500, chunk_overlap=100, split_mode="zh"):
 
 # 默认切分器（兼容旧代码）
 text_splitter = create_splitter()
+
+
+# ============================================
+# 结构化文档按章节/标题边界切分
+# ============================================
+
+# 章节/标题行：「实验一：」「实验3 」「第三章」「一、」等
+HEADING_PATTERN = re.compile(
+    r"^(实验\s*[0-9一二三四五六七八九十]+\s*[：:、\s．.]|"
+    r"第\s*[0-9一二三四五六七八九十]+\s*[章节篇]\s*[：:、\s．.]?|"
+    r"[一二三四五六七八九十]+、)",
+    re.MULTILINE,
+)
+
+
+def split_by_headings(documents: list) -> list:
+    """
+    对结构化文档优先按章节/标题边界切分，标题归入 metadata['section']。
+    无标题（或仅一处标题）的文档原样保留，由 RecursiveCharacterTextSplitter 兜底。
+    返回的段落仍会再经 Recursive 切分器约束 chunk_size。
+    """
+    from langchain_core.documents import Document
+
+    result = []
+    for doc in documents:
+        text = doc.page_content
+        matches = list(HEADING_PATTERN.finditer(text))
+        if len(matches) < 2:
+            result.append(doc)
+            continue
+
+        # 第一个标题之前的前言部分
+        if matches[0].start() > 0:
+            preface = text[:matches[0].start()].strip()
+            if preface:
+                result.append(Document(page_content=preface, metadata=dict(doc.metadata)))
+
+        for i, m in enumerate(matches):
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+            section = text[m.start():end].strip()
+            if not section:
+                continue
+            meta = dict(doc.metadata)
+            meta["section"] = m.group(0).strip("：:、．. \t\n")
+            result.append(Document(page_content=section, metadata=meta))
+
+    return result
 
 
 # ============================================
@@ -173,18 +224,17 @@ def load_documents(doc_dir):
             else:
                 continue
             docs = loader.load()
-            
+
             if filename.endswith(".docx"):
                 content_len = len(docs[0].page_content) if docs else 0
-                print(f"{filename} 内容长度: {content_len}")
-            
+                logger.debug("%s 内容长度: %d", filename, content_len)
+
             for doc in docs:
                 doc.metadata["source"] = filename
             documents.extend(docs)
-            print(f"[OK] 已加载: {filename}")
+            logger.info("[OK] 已加载: %s", filename)
         except Exception as e:
-            print(f"[FAIL] 加载失败: {filename}")
-            print(e)
+            logger.error("[FAIL] 加载失败: %s (%s)", filename, e)
     return documents
 
 # ============================================
@@ -207,7 +257,7 @@ def build_vector_db(chunk_size=500, chunk_overlap=100, split_mode="zh", top_k=5,
         bool: 是否成功
     """
     def report(progress, stage):
-        print(f"[构建进度 {progress}%] {stage}")
+        logger.info("[构建进度 %d%%] %s", progress, stage)
         if progress_callback:
             try:
                 progress_callback(progress, stage)
@@ -218,16 +268,14 @@ def build_vector_db(chunk_size=500, chunk_overlap=100, split_mode="zh", top_k=5,
     report(2, "保存配置")
     save_config(chunk_size, chunk_overlap, split_mode, top_k)
 
-    print(f"\n========== 知识库构建配置 ==========")
-    print(f"Chunk大小: {chunk_size}")
-    print(f"Chunk重叠: {chunk_overlap}")
-    print(f"切分策略: {split_mode}")
-    print(f"检索TopK: {top_k}")
-    print("="*40)
+    logger.info(
+        "知识库构建配置: chunk_size=%d, chunk_overlap=%d, split_mode=%s, top_k=%d",
+        chunk_size, chunk_overlap, split_mode, top_k,
+    )
 
     # 检查文档目录
     if not os.path.exists(DOCS_DIR):
-        print(f"[ERROR] 文档目录不存在: {DOCS_DIR}")
+        logger.error("文档目录不存在: %s", DOCS_DIR)
         return False
 
     # 读取文档
@@ -235,34 +283,34 @@ def build_vector_db(chunk_size=500, chunk_overlap=100, split_mode="zh", top_k=5,
     documents = load_documents(DOCS_DIR)
 
     if not documents:
-        print("[ERROR] 未找到任何文档")
+        logger.error("未找到任何文档")
         return False
 
     report(25, f"已加载 {len(documents)} 个文档")
 
-    print(f"文档总数: {len(documents)}")
-
-    print("\n读取到的文件：")
     for doc in documents:
-        print(doc.metadata)
+        logger.debug("文档 metadata: %s", doc.metadata)
 
-    # 文本切分（使用动态配置）
+    # 文本切分：结构化文档先按章节/标题分段，再由 Recursive 切分器约束长度（兜底）
     report(30, "正在切分文本...")
 
+    structured_docs = split_by_headings(documents)
+    if len(structured_docs) != len(documents):
+        logger.info("结构化切分：%d 个文档 -> %d 个章节段落", len(documents), len(structured_docs))
+
     splitter = create_splitter(chunk_size, chunk_overlap, split_mode)
-    split_docs = splitter.split_documents(documents)
+    split_docs = splitter.split_documents(structured_docs)
 
     report(45, f"切分完成，共 {len(split_docs)} 个Chunk")
 
     # 为每个 chunk 添加唯一标识
-    print("\n正在为Chunk添加metadata...")
     for i, doc in enumerate(split_docs):
         doc.metadata["chunk_id"] = i + 1  # 添加chunk_id
         # 如果没有page信息，默认设为1
         if "page" not in doc.metadata:
             doc.metadata["page"] = 1
 
-    print(f"\n总Chunk数量：{len(split_docs)}")
+    logger.info("总Chunk数量：%d", len(split_docs))
 
     # 删除旧向量库
     if os.path.exists(VECTOR_DB_PATH):
@@ -288,14 +336,12 @@ def build_vector_db(chunk_size=500, chunk_overlap=100, split_mode="zh", top_k=5,
     save_chunk_info_file(split_docs)
 
     report(100, "向量数据库构建完成")
-    print("向量数据库构建完成！")
-    print(f"向量库位置: {VECTOR_DB_PATH}")
+    logger.info("向量数据库构建完成！位置: %s", VECTOR_DB_PATH)
 
     return True
 
 def save_chunk_info_file(docs):
     """将 Chunk 列表写入 chunk_info.txt（供可视化页面使用）"""
-    print("正在保存Chunk信息...")
     os.makedirs(os.path.dirname(CHUNK_INFO_PATH), exist_ok=True)
     with open(CHUNK_INFO_PATH, "w", encoding="utf-8") as f:
         for i, doc in enumerate(docs):
@@ -309,7 +355,7 @@ def save_chunk_info_file(docs):
             f.write("\n")
             f.write("=" * 100)
             f.write("\n")
-    print(f"Chunk信息已保存到: {CHUNK_INFO_PATH}")
+    logger.info("Chunk信息已保存到: %s", CHUNK_INFO_PATH)
 
 
 def ensure_chunk_info_file():
@@ -436,6 +482,7 @@ def delete_file(filename):
         build_vector_db()
         return f"{filename} 删除成功"
     except Exception as e:
+        logger.error("删除文件失败: %s (%s)", filename, e)
         return str(e)
 
 # ============================================
@@ -444,10 +491,10 @@ def delete_file(filename):
 
 def preview_file(filename):
     path = os.path.join(DOCS_DIR, filename)
-    
+
     if not os.path.exists(path):
         return "文件不存在"
-    
+
     try:
         if filename.endswith(".txt"):
             docs = TextLoader(path, encoding="utf-8").load()
@@ -457,16 +504,17 @@ def preview_file(filename):
             docs = Docx2txtLoader(path).load()
         else:
             return "不支持的文件格式"
-        
+
         if not docs:
             return "文件内容为空"
-        
+
         content = docs[0].page_content
         if len(content) > 5000:
             content = content[:5000] + "\n\n--- 内容已截断 ---"
-        
+
         return content
     except Exception as e:
+        logger.error("预览文件失败: %s (%s)", filename, e)
         return f"读取失败: {str(e)}"
 
 # ============================================
@@ -487,7 +535,7 @@ def add_documents_to_db(file_paths):
     try:
         # 加载现有向量库或创建新库
         vector_store = load_vector_store()
-        
+
         # 加载新文档
         new_docs = []
         for file_path in file_paths:
@@ -501,38 +549,38 @@ def add_documents_to_db(file_paths):
                     loader = Docx2txtLoader(file_path)
                 else:
                     continue
-                
+
                 docs = loader.load()
                 for doc in docs:
                     doc.metadata["source"] = filename
                 new_docs.extend(docs)
-                print(f"[OK] 已加载: {filename}")
+                logger.info("[OK] 已加载: %s", filename)
             except Exception as e:
-                print(f"[FAIL] 加载失败: {filename}")
-                print(e)
-        
+                logger.error("[FAIL] 加载失败: %s (%s)", filename, e)
+
         if not new_docs:
             return "没有可添加的文档"
-        
+
         # 切分文本
         split_docs = text_splitter.split_documents(new_docs)
-        
+
         # 添加到向量库
         if vector_store:
             vector_store.add_documents(split_docs)
-            print(f"已向向量库添加 {len(split_docs)} 个文本块")
+            logger.info("已向向量库添加 %d 个文本块", len(split_docs))
         else:
             vector_store = FAISS.from_documents(split_docs, get_embedding_model())
-            print(f"创建新向量库，包含 {len(split_docs)} 个文本块")
-        
+            logger.info("创建新向量库，包含 %d 个文本块", len(split_docs))
+
         # 保存向量库
         if not os.path.exists(VECTOR_DB_PATH):
             os.makedirs(VECTOR_DB_PATH)
         vector_store.save_local(VECTOR_DB_PATH)
-        
+
         return f"成功添加 {len(new_docs)} 个文档，{len(split_docs)} 个文本块"
-    
+
     except Exception as e:
+        logger.error("增量更新失败: %s", e)
         return f"增量更新失败: {str(e)}"
 
 # ============================================
@@ -540,4 +588,6 @@ def add_documents_to_db(file_paths):
 # ============================================
 
 if __name__ == "__main__":
+    from core.logging_config import setup_logging
+    setup_logging()
     build_vector_db()

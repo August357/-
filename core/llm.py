@@ -1,9 +1,14 @@
 import gc
 import os
+import logging
 import threading
 
 os.environ["HF_HUB_DISABLE_SYMLINKS"] = "true"
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+from core.config import get_settings
+
+logger = logging.getLogger(__name__)
 
 _IMPORT_ERROR = None
 try:
@@ -19,11 +24,6 @@ except ImportError as e:
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 LOCAL_MODEL_PATH = os.path.join(BASE_DIR, "models", "chatglm3-6b")
-
-# 8GB 显存安全上限：避免 chat(max_length=8192) 导致 OOM 进程崩溃
-MAX_INPUT_CHARS = 2500
-MAX_NEW_TOKENS = 512
-MAX_TOTAL_TOKENS = 2048
 
 _model = None
 _tokenizer = None
@@ -47,7 +47,7 @@ def load_model():
                 "请运行: pip install transformers torch bitsandbytes accelerate"
             ) from _IMPORT_ERROR
 
-        print("首次加载模型...")
+        logger.info("首次加载模型...")
 
         if not os.path.exists(LOCAL_MODEL_PATH):
             raise FileNotFoundError(f"模型目录不存在: {LOCAL_MODEL_PATH}")
@@ -59,7 +59,7 @@ def load_model():
             except Exception:
                 pass
 
-        print("正在加载Tokenizer...")
+        logger.info("正在加载Tokenizer...")
         try:
             _tokenizer = AutoTokenizer.from_pretrained(
                 LOCAL_MODEL_PATH,
@@ -68,7 +68,7 @@ def load_model():
         except Exception as e:
             raise RuntimeError(f"加载Tokenizer失败: {e}") from e
 
-        print("正在加载模型(4-bit)...")
+        logger.info("正在加载模型(4-bit)...")
         try:
             quantization_config = BitsAndBytesConfig(
                 load_in_4bit=True,
@@ -86,26 +86,23 @@ def load_model():
         except Exception as e:
             raise RuntimeError(f"加载模型失败: {e}") from e
 
-        print("模型加载完成")
+        logger.info("模型加载完成")
         if hasattr(_model, "hf_device_map"):
-            print(_model.hf_device_map)
+            logger.info("device_map: %s", _model.hf_device_map)
 
     return _model, _tokenizer
-
-
-# 多轮对话 history 的安全上限：最多 3 轮，每条内容截断，避免撑爆显存
-MAX_HISTORY_ROUNDS = 3
-MAX_HISTORY_CHARS = 800
 
 
 def _normalize_history(history) -> list:
     """
     将 [{'question':..., 'answer':...}] 或 ChatGLM 格式的 history
     统一为 ChatGLM3 的 [{'role': 'user'/'assistant', 'content': ...}] 列表，
-    只保留最近 MAX_HISTORY_ROUNDS 轮并截断过长内容。
+    只保留最近 HISTORY_ROUNDS 轮并截断过长内容，避免撑爆显存。
     """
     if not history:
         return []
+
+    settings = get_settings()
 
     messages = []
     for item in history:
@@ -118,25 +115,29 @@ def _normalize_history(history) -> list:
             messages.append({"role": "user", "content": str(item[0])})
             messages.append({"role": "assistant", "content": str(item[1])})
 
-    messages = messages[-MAX_HISTORY_ROUNDS * 2:]
+    messages = messages[-settings.HISTORY_ROUNDS * 2:]
     return [
-        {"role": m["role"], "content": m["content"][:MAX_HISTORY_CHARS]}
+        {"role": m["role"], "content": m["content"][:settings.MAX_HISTORY_CHARS]}
         for m in messages
         if m["content"].strip()
     ]
 
 
-def chat_model(query: str, max_new_tokens: int = MAX_NEW_TOKENS, history=None) -> str:
+def chat_model(query: str, max_new_tokens: int = None, history=None) -> str:
     """
     线程安全、限长推理，防止 max_length=8192 撑爆 8GB 显存导致进程被系统杀死。
     history 为多轮对话上下文（ChatGLM3 格式或 [{question, answer}]）。
     """
+    settings = get_settings()
+    if max_new_tokens is None:
+        max_new_tokens = settings.MAX_NEW_TOKENS
+
     text = (query or "").strip()
     if not text:
         return "请输入有效问题。"
 
-    if len(text) > MAX_INPUT_CHARS:
-        text = text[:MAX_INPUT_CHARS] + "\n...(输入过长已截断)"
+    if len(text) > settings.MAX_INPUT_CHARS:
+        text = text[:settings.MAX_INPUT_CHARS] + "\n...(输入过长已截断)"
 
     chat_history = _normalize_history(history)
 
@@ -150,11 +151,14 @@ def chat_model(query: str, max_new_tokens: int = MAX_NEW_TOKENS, history=None) -
 
         inputs = tokenizer.build_chat_input(text, history=chat_history, role="user")
         input_len = int(inputs["input_ids"].shape[1])
-        max_length = min(input_len + max_new_tokens, MAX_TOTAL_TOKENS)
+        max_length = min(input_len + max_new_tokens, settings.MAX_TOTAL_TOKENS)
         if max_length <= input_len:
-            max_length = min(input_len + 128, MAX_TOTAL_TOKENS)
+            max_length = min(input_len + 128, settings.MAX_TOTAL_TOKENS)
 
-        print(f"LLM 推理: input_tokens≈{input_len}, max_length={max_length}, history轮数={len(chat_history)//2}")
+        logger.info(
+            "LLM 推理: input_tokens≈%d, max_length=%d, history轮数=%d",
+            input_len, max_length, len(chat_history) // 2,
+        )
 
         response, _ = model.chat(
             tokenizer,
@@ -166,18 +170,22 @@ def chat_model(query: str, max_new_tokens: int = MAX_NEW_TOKENS, history=None) -
         return response
 
 
-def stream_chat_model(query: str, history=None, max_new_tokens: int = MAX_NEW_TOKENS):
+def stream_chat_model(query: str, history=None, max_new_tokens: int = None):
     """
     流式推理：逐 token 增量 yield 新生成的文本。
     基于 ChatGLM3 的 model.stream_chat（其输出为累积文本，此处转为增量）。
     """
+    settings = get_settings()
+    if max_new_tokens is None:
+        max_new_tokens = settings.MAX_NEW_TOKENS
+
     text = (query or "").strip()
     if not text:
         yield "请输入有效问题。"
         return
 
-    if len(text) > MAX_INPUT_CHARS:
-        text = text[:MAX_INPUT_CHARS] + "\n...(输入过长已截断)"
+    if len(text) > settings.MAX_INPUT_CHARS:
+        text = text[:settings.MAX_INPUT_CHARS] + "\n...(输入过长已截断)"
 
     chat_history = _normalize_history(history)
 
@@ -191,11 +199,14 @@ def stream_chat_model(query: str, history=None, max_new_tokens: int = MAX_NEW_TO
 
         inputs = tokenizer.build_chat_input(text, history=chat_history, role="user")
         input_len = int(inputs["input_ids"].shape[1])
-        max_length = min(input_len + max_new_tokens, MAX_TOTAL_TOKENS)
+        max_length = min(input_len + max_new_tokens, settings.MAX_TOTAL_TOKENS)
         if max_length <= input_len:
-            max_length = min(input_len + 128, MAX_TOTAL_TOKENS)
+            max_length = min(input_len + 128, settings.MAX_TOTAL_TOKENS)
 
-        print(f"LLM 流式推理: input_tokens≈{input_len}, max_length={max_length}, history轮数={len(chat_history)//2}")
+        logger.info(
+            "LLM 流式推理: input_tokens≈%d, max_length=%d, history轮数=%d",
+            input_len, max_length, len(chat_history) // 2,
+        )
 
         past = ""
         for response, _ in model.stream_chat(
@@ -213,8 +224,10 @@ def stream_chat_model(query: str, history=None, max_new_tokens: int = MAX_NEW_TO
 
 def test_model():
     answer = chat_model("你好")
-    print("\n回答:", answer)
+    logger.info("回答: %s", answer)
 
 
 if __name__ == "__main__":
+    from core.logging_config import setup_logging
+    setup_logging()
     test_model()
