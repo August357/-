@@ -5,12 +5,16 @@ import bcrypt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from backend.database import get_db
+from core.config import get_settings
 import os
 import sqlite3
 import json
+import logging
 
-# JWT配置：密钥必须从环境变量读取，禁止硬编码默认值
-SECRET_KEY = os.environ.get("JWT_SECRET")
+logger = logging.getLogger(__name__)
+
+# JWT配置：密钥必须从环境变量 JWT_SECRET（或 .env）读取，禁止硬编码默认值
+SECRET_KEY = get_settings().JWT_SECRET
 if not SECRET_KEY:
     raise RuntimeError(
         "环境变量 JWT_SECRET 未设置，服务拒绝启动。"
@@ -100,7 +104,7 @@ def register_user(username: str, password: str) -> bool:
         conn.commit()
         return True
     except Exception as e:
-        print("注册异常:", e)
+        logger.error("注册异常: %s", e)
         conn.rollback()
         raise
     finally:

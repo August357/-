@@ -10,6 +10,7 @@ from fastapi.responses import StreamingResponse
 from fastapi.concurrency import run_in_threadpool
 import asyncio
 import json
+import logging
 import shutil
 import threading
 import uuid
@@ -19,8 +20,14 @@ from backend.schemas import AskRequest, BuildDBRequest, RegisterRequest, LoginRe
 from backend.system_api import get_system_info
 from backend.auth import register_user, authenticate_user, create_access_token, get_current_user, save_chat_history, get_chat_history, get_session_history
 from backend.database import get_db
+from core.config import get_settings
+from core.logging_config import setup_logging
 from core.qa_chain import ask, ask_stream
 from core.llm import load_model
+
+settings = get_settings()
+setup_logging(settings.LOG_LEVEL, settings.LOG_FILE)
+logger = logging.getLogger(__name__)
 from core.vector_store import (
     build_vector_db,
     list_knowledge_files,
@@ -41,17 +48,17 @@ _llm_load_error = ""
 def preload_llm():
     """启动时预加载 LLM；失败时不终止整个服务，便于前端仍能访问其他接口"""
     global _llm_ready, _llm_load_error
-    print("正在预加载 ChatGLM3-6B 模型...")
+    logger.info("正在预加载 ChatGLM3-6B 模型...")
     try:
         load_model()
         _llm_ready = True
         _llm_load_error = ""
-        print("ChatGLM3-6B 预加载完成")
+        logger.info("ChatGLM3-6B 预加载完成")
     except Exception as e:
         _llm_ready = False
         _llm_load_error = str(e)
-        print(f"ChatGLM3-6B 预加载失败（服务仍运行）: {e}")
-        print("问答接口将返回错误提示，请检查 models/chatglm3-6b 与 GPU 显存")
+        logger.warning("ChatGLM3-6B 预加载失败（服务仍运行）: %s", e)
+        logger.warning("问答接口将返回错误提示，请检查 models/chatglm3-6b 与 GPU 显存")
 
 
 @app.get("/api/health")
@@ -64,10 +71,10 @@ def health():
     }
 
 
-# 仅允许前端开发服务器来源，不再使用通配符
+# 仅允许前端开发服务器来源，不再使用通配符（可用 CORS_ORIGINS 环境变量覆盖）
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=settings.cors_origin_list,
     allow_methods=["*"],
     allow_headers=["*"]
 )
@@ -81,7 +88,7 @@ DOCS_DIR = os.path.join(
 
 # 上传限制
 ALLOWED_EXTENSIONS = {".txt", ".pdf", ".docx"}
-MAX_UPLOAD_SIZE = 50 * 1024 * 1024  # 50MB
+MAX_UPLOAD_SIZE = settings.max_upload_bytes
 
 
 def safe_join(base_dir: str, filename: str) -> str:
@@ -131,13 +138,7 @@ async def ask_api(
         return result
 
     except Exception as e:
-        import traceback
-
-        print("\n")
-        print("=" * 80)
-        print("ASK接口异常")
-        traceback.print_exc()
-        print("=" * 80)
+        logger.exception("ASK接口异常: %s", e)
 
         raise HTTPException(
             status_code=500,
@@ -182,8 +183,7 @@ def ask_stream_api(
             )
             yield "data: [DONE]\n\n"
         except Exception as e:
-            import traceback
-            traceback.print_exc()
+            logger.exception("流式问答接口异常: %s", e)
             yield f"data: {json.dumps({'type': 'error', 'detail': str(e)}, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(
@@ -408,7 +408,7 @@ async def upload(file: UploadFile = File(...), current_user: dict = Depends(get_
                     break
                 written += len(chunk)
                 if written > MAX_UPLOAD_SIZE:
-                    raise HTTPException(status_code=413, detail="文件超过 50MB 大小限制")
+                    raise HTTPException(status_code=413, detail=f"文件超过 {settings.MAX_UPLOAD_MB}MB 大小限制")
                 f.write(chunk)
     except Exception:
         if os.path.exists(path):

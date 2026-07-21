@@ -26,6 +26,7 @@ data/docs/*
 # 环境变量与密钥
 .env
 .env.*
+!.env.example
 *.pem
 
 # Python 缓存

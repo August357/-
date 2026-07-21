@@ -1,5 +1,8 @@
 import sqlite3
 import os
+import logging
+
+logger = logging.getLogger(__name__)
 
 DB_PATH = os.path.join(
     os.path.dirname(os.path.dirname(__file__)),
@@ -8,9 +11,7 @@ DB_PATH = os.path.join(
 )
 
 def get_db():
-    print("=" * 60)
-    print("当前数据库:", os.path.abspath(DB_PATH))
-    print("=" * 60)
+    logger.debug("当前数据库: %s", os.path.abspath(DB_PATH))
 
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row

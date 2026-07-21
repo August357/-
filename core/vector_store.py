@@ -189,6 +189,7 @@ def save_config(chunk_size, chunk_overlap, split_mode, top_k):
         "split_mode": split_mode,
         "top_k": top_k
     }
+    os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2)
 
