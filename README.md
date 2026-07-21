@@ -5,6 +5,8 @@
 ## 功能特性
 
 - 文档加载与分块（PDF、Word、TXT），结构化文档按章节/标题边界优先切分
+- 特殊格式识别：表格抽取为 Markdown、代码块加围栏保留，切分时整段原子保护
+  （PDF 用 pdfplumber、DOCX 用 python-docx 按正文顺序解析、TXT 识别围栏/缩进代码与管道表格）
 - FAISS 向量检索 + BM25 混合检索（归一化加权融合）+ BGE 重排序
 - ChatGLM3-6B 4-bit 本地推理
 - 多轮对话：按 session 取最近 3 轮历史，指代/省略问题先改写再检索

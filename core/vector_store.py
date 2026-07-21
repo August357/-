@@ -174,6 +174,25 @@ def split_by_headings(documents: list) -> list:
     return result
 
 
+def split_docs_smart(documents: list, splitter, chunk_size: int) -> list:
+    """
+    结构感知切分：table/code 块作为原子单元保留（不超过 1.5×chunk_size 时整段保留），
+    其余文本走 RecursiveCharacterTextSplitter；超长表格/代码最终仍按兜底切分。
+    """
+    out = []
+    kept = 0
+    for doc in documents:
+        block_type = doc.metadata.get("block_type")
+        if block_type in ("table", "code") and len(doc.page_content) <= chunk_size * 1.5:
+            out.append(doc)
+            kept += 1
+        else:
+            out.extend(splitter.split_documents([doc]))
+    if kept:
+        logger.info("结构保护：%d 个表格/代码块被整段保留", kept)
+    return out
+
+
 # ============================================
 # 当前配置（保存到文件供查询）
 # ============================================
@@ -208,32 +227,45 @@ def load_config():
 
 
 # ============================================
-# 文档加载函数
+# 文档加载函数（结构化解析：识别表格/代码块）
 # ============================================
 
+def _legacy_load(file_path, filename):
+    """旧版纯文本加载（作为结构化解析失败时的兜底）"""
+    if filename.endswith(".txt"):
+        loader = TextLoader(file_path, encoding="utf-8")
+    elif filename.endswith(".pdf"):
+        loader = PyPDFLoader(file_path)
+    elif filename.endswith(".docx"):
+        loader = Docx2txtLoader(file_path)
+    else:
+        return []
+    return loader.load()
+
+
 def load_documents(doc_dir):
+    from core import doc_parser
+
     documents = []
     for filename in os.listdir(doc_dir):
         file_path = os.path.join(doc_dir, filename)
+        ext = os.path.splitext(filename)[1].lower()
+        if ext not in {".txt", ".pdf", ".docx"}:
+            continue
         try:
-            if filename.endswith(".txt"):
-                loader = TextLoader(file_path, encoding="utf-8")
-            elif filename.endswith(".pdf"):
-                loader = PyPDFLoader(file_path)
-            elif filename.endswith(".docx"):
-                loader = Docx2txtLoader(file_path)
-            else:
-                continue
-            docs = loader.load()
-
-            if filename.endswith(".docx"):
-                content_len = len(docs[0].page_content) if docs else 0
-                logger.debug("%s 内容长度: %d", filename, content_len)
-
-            for doc in docs:
-                doc.metadata["source"] = filename
+            # 结构化解析：表格转 Markdown、代码块加围栏，metadata 带 block_type
+            blocks = doc_parser.parse_file(file_path)
+            docs = doc_parser.blocks_to_documents(blocks, filename)
+            if not docs:
+                logger.warning("[WARN] 结构化解析无内容，回退纯文本加载: %s", filename)
+                docs = _legacy_load(file_path, filename)
+                for doc in docs:
+                    doc.metadata["source"] = filename
+            type_counts = {}
+            for d in docs:
+                type_counts[d.metadata.get("block_type", "text")] = type_counts.get(d.metadata.get("block_type", "text"), 0) + 1
             documents.extend(docs)
-            logger.info("[OK] 已加载: %s", filename)
+            logger.info("[OK] 已加载: %s (%s)", filename, ", ".join(f"{k}×{v}" for k, v in type_counts.items()))
         except Exception as e:
             logger.error("[FAIL] 加载失败: %s (%s)", filename, e)
     return documents
@@ -300,7 +332,7 @@ def build_vector_db(chunk_size=500, chunk_overlap=100, split_mode="zh", top_k=5,
         logger.info("结构化切分：%d 个文档 -> %d 个章节段落", len(documents), len(structured_docs))
 
     splitter = create_splitter(chunk_size, chunk_overlap, split_mode)
-    split_docs = splitter.split_documents(structured_docs)
+    split_docs = split_docs_smart(structured_docs, splitter, chunk_size)
 
     report(45, f"切分完成，共 {len(split_docs)} 个Chunk")
 
@@ -533,27 +565,23 @@ def load_vector_store():
 
 def add_documents_to_db(file_paths):
     """向向量库添加新文档（增量更新）"""
+    from core import doc_parser
+
     try:
         # 加载现有向量库或创建新库
         vector_store = load_vector_store()
 
-        # 加载新文档
+        # 加载新文档（结构化解析，与全量构建一致）
         new_docs = []
         for file_path in file_paths:
             filename = os.path.basename(file_path)
             try:
-                if filename.endswith(".txt"):
-                    loader = TextLoader(file_path, encoding="utf-8")
-                elif filename.endswith(".pdf"):
-                    loader = PyPDFLoader(file_path)
-                elif filename.endswith(".docx"):
-                    loader = Docx2txtLoader(file_path)
-                else:
-                    continue
-
-                docs = loader.load()
-                for doc in docs:
-                    doc.metadata["source"] = filename
+                blocks = doc_parser.parse_file(file_path)
+                docs = doc_parser.blocks_to_documents(blocks, filename)
+                if not docs:
+                    docs = _legacy_load(file_path, filename)
+                    for doc in docs:
+                        doc.metadata["source"] = filename
                 new_docs.extend(docs)
                 logger.info("[OK] 已加载: %s", filename)
             except Exception as e:
@@ -562,8 +590,10 @@ def add_documents_to_db(file_paths):
         if not new_docs:
             return "没有可添加的文档"
 
-        # 切分文本
-        split_docs = text_splitter.split_documents(new_docs)
+        # 切分文本（结构感知，表格/代码块原子保留）
+        config = load_config()
+        splitter = create_splitter(config["chunk_size"], config["chunk_overlap"], config["split_mode"])
+        split_docs = split_docs_smart(split_by_headings(new_docs), splitter, config["chunk_size"])
 
         # 添加到向量库
         if vector_store:
