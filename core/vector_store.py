@@ -191,54 +191,69 @@ def load_documents(doc_dir):
 # 构建向量库函数（可被外部调用）
 # ============================================
 
-def build_vector_db(chunk_size=500, chunk_overlap=100, split_mode="zh", top_k=5):
+def build_vector_db(chunk_size=500, chunk_overlap=100, split_mode="zh", top_k=5, progress_callback=None):
     """
     构建向量数据库（支持动态配置）
-    
+
     Args:
         chunk_size: Chunk大小（100-2000）
         chunk_overlap: Chunk重叠（0-500）
         split_mode: 切分策略（zh/paragraph/sentence）
         top_k: 检索TopK数量（1-10）
-    
+        progress_callback: 可选回调 fn(progress:int, stage:str)，
+            在 加载/切分/向量化/保存 各阶段上报真实进度（0-100）
+
     Returns:
         bool: 是否成功
     """
+    def report(progress, stage):
+        print(f"[构建进度 {progress}%] {stage}")
+        if progress_callback:
+            try:
+                progress_callback(progress, stage)
+            except Exception:
+                pass
+
     # 保存配置
+    report(2, "保存配置")
     save_config(chunk_size, chunk_overlap, split_mode, top_k)
-    
+
     print(f"\n========== 知识库构建配置 ==========")
     print(f"Chunk大小: {chunk_size}")
     print(f"Chunk重叠: {chunk_overlap}")
     print(f"切分策略: {split_mode}")
     print(f"检索TopK: {top_k}")
     print("="*40)
-    
+
     # 检查文档目录
     if not os.path.exists(DOCS_DIR):
         print(f"[ERROR] 文档目录不存在: {DOCS_DIR}")
         return False
-    
+
     # 读取文档
-    print("正在读取文档...")
+    report(5, "正在读取文档...")
     documents = load_documents(DOCS_DIR)
-    
+
     if not documents:
         print("[ERROR] 未找到任何文档")
         return False
-    
+
+    report(25, f"已加载 {len(documents)} 个文档")
+
     print(f"文档总数: {len(documents)}")
-    
+
     print("\n读取到的文件：")
     for doc in documents:
         print(doc.metadata)
-    
+
     # 文本切分（使用动态配置）
-    print("正在切分文本...")
-    
+    report(30, "正在切分文本...")
+
     splitter = create_splitter(chunk_size, chunk_overlap, split_mode)
     split_docs = splitter.split_documents(documents)
-    
+
+    report(45, f"切分完成，共 {len(split_docs)} 个Chunk")
+
     # 为每个 chunk 添加唯一标识
     print("\n正在为Chunk添加metadata...")
     for i, doc in enumerate(split_docs):
@@ -246,80 +261,36 @@ def build_vector_db(chunk_size=500, chunk_overlap=100, split_mode="zh", top_k=5)
         # 如果没有page信息，默认设为1
         if "page" not in doc.metadata:
             doc.metadata["page"] = 1
-    
-    print("\n========== 文档切片结果 ==========")
-    
-    for i, doc in enumerate(split_docs):
-    
-        source = doc.metadata.get("source", "未知")
-        chunk_id = doc.metadata.get("chunk_id", i + 1)
-        page = doc.metadata.get("page", "未知")
-    
-        print(f"\nChunk {chunk_id}")
-    
-        print(f"来源：{source}")
-        
-        print(f"页码：P{page}")
-    
-        print(f"长度：{len(doc.page_content)}")
-    
-        print("内容预览：")
-        preview = doc.page_content[:300]
-        try:
-            print(preview)
-        except UnicodeEncodeError:
-            print(preview.encode("utf-8", errors="replace").decode("utf-8", errors="replace"))
-    
-        print("-" * 80)
-    
+
     print(f"\n总Chunk数量：{len(split_docs)}")
-    
-    # Chunk重叠验证
-    print("\n========== Chunk重叠验证 ==========")
-    
-    for i in range(len(split_docs)-1):
-    
-        current = split_docs[i].page_content
-    
-        nxt = split_docs[i+1].page_content
-    
-        overlap = current[-100:]
-    
-        try:
-            print(f"\nChunk {i+1} 后100字符：")
-            print(overlap)
-            print(f"\nChunk {i+2} 前100字符：")
-            print(nxt[:100])
-        except UnicodeEncodeError:
-            print(overlap.encode("utf-8", errors="replace").decode("utf-8", errors="replace"))
-    
-        print("="*80)
-    
+
     # 删除旧向量库
     if os.path.exists(VECTOR_DB_PATH):
         shutil.rmtree(VECTOR_DB_PATH)
-    
-    # 创建FAISS向量库
-    print("正在创建FAISS向量库...")
+
+    # 创建FAISS向量库（最耗时阶段）
+    report(55, "正在向量化并创建FAISS向量库...")
     vector_store = FAISS.from_documents(
         split_docs,
         get_embedding_model()
     )
-    
+
+    report(85, "向量化完成，正在保存向量库...")
+
     # 创建保存目录
     if not os.path.exists(VECTOR_DB_PATH):
         os.makedirs(VECTOR_DB_PATH)
-    
+
     # 保存向量数据库
-    print("正在保存向量库...")
     vector_store.save_local(VECTOR_DB_PATH)
 
     # 须在向量库目录创建后再写入，避免被上面的 rmtree 删除
     save_chunk_info_file(split_docs)
-    
+
+    report(100, "向量数据库构建完成")
     print("向量数据库构建完成！")
     print(f"向量库位置: {VECTOR_DB_PATH}")
-    
+
     return True
 
 def save_chunk_info_file(docs):

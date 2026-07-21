@@ -95,7 +95,7 @@ v-if="buildStatus.status === 'building'"
 class="progress-area"
 >
 
-<p>正在构建向量库...</p>
+<p>正在构建向量库...{{ buildStatus.stage ? `（${buildStatus.stage}）` : "" }}</p>
 
 <el-progress
 :percentage="buildStatus.progress"
@@ -171,6 +171,10 @@ const checkProgress = async () => {
 
     if (buildStatus.value.status === 'building') {
       progressTimer = setTimeout(checkProgress, 1000);
+    } else if (buildStatus.value.status === 'completed') {
+      ElMessage.success("知识库重建完成");
+    } else if (buildStatus.value.status === 'failed') {
+      ElMessage.error(buildStatus.value.error || "知识库重建失败");
     }
   } catch (e) {
     console.error("获取进度失败", e);
@@ -196,17 +200,18 @@ checkProgress();
 const save =
 async()=>{
 
-await buildDb(
+// 提交后台构建任务，立即返回 task_id，随后轮询真实进度
+const res = await buildDb(
 config
 );
 
-// 开始轮询进度
-buildStatus.value = { progress: 0, status: "building" };
-checkProgress();
+buildStatus.value = { progress: 0, status: "building", stage: "任务已提交" };
 
-ElMessage.success(
-"知识库重建完成"
+ElMessage.info(
+"构建任务已提交，正在后台执行..."
 );
+
+checkProgress();
 
 };
 

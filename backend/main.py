@@ -7,8 +7,12 @@ from fastapi import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from fastapi.concurrency import run_in_threadpool
+import asyncio
 import json
 import shutil
+import threading
+import uuid
 import os
 
 from backend.schemas import AskRequest, BuildDBRequest, RegisterRequest, LoginRequest
@@ -103,23 +107,25 @@ def safe_join(base_dir: str, filename: str) -> str:
 # ==========================
 
 @app.post("/api/ask")
-def ask_api(
+async def ask_api(
     req: AskRequest,
     current_user: dict = Depends(get_current_user)
 ):
     try:
-        history = get_session_history(
-            current_user["user_id"], req.session_id, limit=3
+        history = await run_in_threadpool(
+            get_session_history, current_user["user_id"], req.session_id, 3
         ) if req.session_id else []
 
-        result = ask(req.query, history=history)
+        # 检索/重排序/LLM 均为同步阻塞调用，放到线程池避免阻塞事件循环
+        result = await run_in_threadpool(ask, req.query, True, history)
 
-        save_chat_history(
-            user_id=current_user["user_id"],
-            question=req.query,
-            answer=result.get("answer", ""),
-            sources=result.get("sources", []),
-            session_id=req.session_id
+        await run_in_threadpool(
+            save_chat_history,
+            current_user["user_id"],
+            req.query,
+            result.get("answer", ""),
+            result.get("sources", []),
+            req.session_id
         )
 
         return result
@@ -257,36 +263,73 @@ def get_config(current_user: dict = Depends(get_current_user)):
     return load_config()
 
 
-# 全局变量跟踪构建进度
-build_progress = {"progress": 0, "status": "idle"}
+# 全局构建任务状态（单任务；task_id 标识一次构建）
+_build_state = {
+    "task_id": None,
+    "progress": 0,
+    "status": "idle",   # idle / building / completed / failed
+    "stage": "",
+    "error": None,
+}
+_build_lock = threading.Lock()
 
-# ==========================
-# 修改Chunk配置接口
-# ==========================
 
-@app.post("/api/build-db")
-def build_db(req: BuildDBRequest, current_user: dict = Depends(get_current_user)):
-    global build_progress
+def _update_build_progress(progress: int, stage: str):
+    with _build_lock:
+        _build_state["progress"] = progress
+        _build_state["stage"] = stage
 
-    # 重置进度
-    build_progress = {"progress": 0, "status": "building"}
 
+def _run_build_task(req: BuildDBRequest):
+    """后台线程执行的构建任务"""
     try:
         success = build_vector_db(
             chunk_size=req.chunk_size,
             chunk_overlap=req.chunk_overlap,
             split_mode=req.split_mode,
-            top_k=req.top_k
+            top_k=req.top_k,
+            progress_callback=_update_build_progress,
         )
-
-        build_progress = {"progress": 100, "status": "completed"}
-
-        return {
-            "success": success
-        }
+        with _build_lock:
+            if success:
+                _build_state["progress"] = 100
+                _build_state["status"] = "completed"
+                _build_state["stage"] = "构建完成"
+            else:
+                _build_state["status"] = "failed"
+                _build_state["error"] = "构建失败，请检查文档目录与后端日志"
     except Exception as e:
-        build_progress = {"progress": 0, "status": "failed"}
-        raise HTTPException(status_code=500, detail=str(e))
+        with _build_lock:
+            _build_state["status"] = "failed"
+            _build_state["error"] = str(e)
+
+
+# ==========================
+# 修改Chunk配置接口（后台任务）
+# ==========================
+
+@app.post("/api/build-db")
+async def build_db(req: BuildDBRequest, current_user: dict = Depends(get_current_user)):
+    with _build_lock:
+        if _build_state["status"] == "building":
+            raise HTTPException(status_code=409, detail="已有构建任务正在进行中")
+        _build_state.update({
+            "task_id": uuid.uuid4().hex,
+            "progress": 0,
+            "status": "building",
+            "stage": "任务已提交",
+            "error": None,
+        })
+        task_id = _build_state["task_id"]
+
+    # 提交后立即返回 task_id，构建在线程池中异步执行
+    asyncio.get_running_loop().run_in_executor(None, _run_build_task, req)
+
+    return {
+        "success": True,
+        "task_id": task_id,
+        "status": "building",
+    }
 
 
 # ==========================
@@ -294,8 +337,13 @@ def build_db(req: BuildDBRequest, current_user: dict = Depends(get_current_user)
 # ==========================
 
 @app.get("/api/build-status")
-def get_build_status(current_user: dict = Depends(get_current_user)):
-    return build_progress
+def get_build_status(task_id: str = None, current_user: dict = Depends(get_current_user)):
+    with _build_lock:
+        state = dict(_build_state)
+    # 指定 task_id 且不匹配时说明任务已不存在（如服务重启）
+    if task_id and state["task_id"] != task_id:
+        return {"task_id": task_id, "progress": 0, "status": "unknown", "stage": "", "error": None}
+    return state
 
 
 # ==========================
