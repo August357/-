@@ -33,8 +33,9 @@ CHUNK_INFO_PATH = os.path.join(
     "chunk_info.txt"
 )
 
-# Embedding模型本地路径
-EMBEDDING_MODEL_PATH = os.path.join(BASE_DIR, "models", "bge-small-zh-v1.5")
+# Embedding模型配置
+EMBEDDING_MODEL_NAME = "bge-small-zh-v1.5"
+EMBEDDING_MODEL_PATH = os.path.join(BASE_DIR, "models", EMBEDDING_MODEL_NAME)
 
 # ============================================
 # 设备配置

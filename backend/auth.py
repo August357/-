@@ -1,15 +1,21 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from jose import JWTError, jwt
 import bcrypt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from backend.database import get_db
+import os
 import sqlite3
 import json
 
-# JWT配置
-SECRET_KEY = "your-secret-key-change-in-production"
+# JWT配置：密钥必须从环境变量读取，禁止硬编码默认值
+SECRET_KEY = os.environ.get("JWT_SECRET")
+if not SECRET_KEY:
+    raise RuntimeError(
+        "环境变量 JWT_SECRET 未设置，服务拒绝启动。"
+        "请先执行：export JWT_SECRET='<随机长字符串>' 后再启动后端。"
+    )
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # 24小时
 
@@ -37,9 +43,9 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     """创建JWT token"""
     to_encode = data.copy()
     if expires_delta:
-        expire = datetime.utcnow() + expires_delta
+        expire = datetime.now(timezone.utc) + expires_delta
     else:
-        expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
 
     to_encode.update({"exp": expire})
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)

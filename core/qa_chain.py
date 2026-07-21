@@ -7,7 +7,7 @@ import os
 import gc
 import json
 import re
-import torch
+import threading
 
 from langchain_community.vectorstores import FAISS
 
@@ -86,16 +86,44 @@ def _reset_reranker():
     gc.collect()
 
 # ============================================
-# 动态加载向量库
+# 动态加载向量库（按 index.faiss 的 mtime 缓存，未变化时复用内存实例）
 # ============================================
 
+_vector_store_cache = None
+_vector_store_mtime = None
+_vector_store_lock = threading.Lock()
+
+
+def _index_mtime() -> float:
+    index_path = os.path.join(VECTOR_DB_PATH, "index.faiss")
+    if not os.path.exists(index_path):
+        return -1
+    return os.path.getmtime(index_path)
+
+
 def load_vector_store():
-    """加载FAISS向量库"""
-    return FAISS.load_local(
-        VECTOR_DB_PATH,
-        get_embedding_model(),
-        allow_dangerous_deserialization=True
-    )
+    """加载FAISS向量库；index.faiss 未变化时直接复用缓存实例"""
+    global _vector_store_cache, _vector_store_mtime
+    mtime = _index_mtime()
+    with _vector_store_lock:
+        if _vector_store_cache is not None and mtime == _vector_store_mtime:
+            return _vector_store_cache
+        store = FAISS.load_local(
+            VECTOR_DB_PATH,
+            get_embedding_model(),
+            allow_dangerous_deserialization=True
+        )
+        _vector_store_cache = store
+        _vector_store_mtime = mtime
+        return store
+
+
+def reset_vector_store_cache():
+    """重建向量库后调用，强制下次访问时重新加载"""
+    global _vector_store_cache, _vector_store_mtime
+    with _vector_store_lock:
+        _vector_store_cache = None
+        _vector_store_mtime = None
 
 # ============================================
 # 文档检索（使用MMR，支持动态TopK）

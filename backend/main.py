@@ -20,7 +20,9 @@ from core.vector_store import (
     list_knowledge_files,
     preview_file,
     delete_file,
-    load_config
+    load_config,
+    parse_chunk_info_file,
+    EMBEDDING_MODEL_NAME
 )
 
 app = FastAPI()
@@ -56,9 +58,10 @@ def health():
     }
 
 
+# 仅允许前端开发服务器来源，不再使用通配符
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
     allow_methods=["*"],
     allow_headers=["*"]
 )
@@ -69,6 +72,28 @@ DOCS_DIR = os.path.join(
     "data",
     "docs"
 )
+
+# 上传限制
+ALLOWED_EXTENSIONS = {".txt", ".pdf", ".docx"}
+MAX_UPLOAD_SIZE = 50 * 1024 * 1024  # 50MB
+
+
+def safe_join(base_dir: str, filename: str) -> str:
+    """
+    校验文件名并拼接为 base_dir 内的绝对路径，防止路径穿越。
+    非法文件名直接抛出 400。
+    """
+    if not filename or filename in {".", ".."}:
+        raise HTTPException(status_code=400, detail="非法文件名")
+    # 拒绝任何路径分隔符，只允许纯文件名
+    if "/" in filename or "\\" in filename or "\x00" in filename:
+        raise HTTPException(status_code=400, detail="非法文件名")
+
+    base_real = os.path.realpath(base_dir)
+    target = os.path.realpath(os.path.join(base_real, filename))
+    if os.path.commonpath([base_real, target]) != base_real:
+        raise HTTPException(status_code=400, detail="非法文件名")
+    return target
 
 
 # ==========================
@@ -170,7 +195,7 @@ def get_history(current_user: dict = Depends(get_current_user)):
 # ==========================
 
 @app.get("/api/config")
-def get_config():
+def get_config(current_user: dict = Depends(get_current_user)):
     return load_config()
 
 
@@ -182,7 +207,7 @@ build_progress = {"progress": 0, "status": "idle"}
 # ==========================
 
 @app.post("/api/build-db")
-def build_db(req: BuildDBRequest):
+def build_db(req: BuildDBRequest, current_user: dict = Depends(get_current_user)):
     global build_progress
 
     # 重置进度
@@ -211,7 +236,7 @@ def build_db(req: BuildDBRequest):
 # ==========================
 
 @app.get("/api/build-status")
-def get_build_status():
+def get_build_status(current_user: dict = Depends(get_current_user)):
     return build_progress
 
 
@@ -220,7 +245,7 @@ def get_build_status():
 # ==========================
 
 @app.get("/api/files")
-def get_files():
+def get_files(current_user: dict = Depends(get_current_user)):
     return {
         "files": list_knowledge_files()
     }
@@ -231,7 +256,8 @@ def get_files():
 # ==========================
 
 @app.get("/api/preview/{filename}")
-def preview(filename: str):
+def preview(filename: str, current_user: dict = Depends(get_current_user)):
+    safe_join(DOCS_DIR, filename)
     return {
         "content": preview_file(filename)
     }
@@ -242,7 +268,8 @@ def preview(filename: str):
 # ==========================
 
 @app.delete("/api/file/{filename}")
-def delete(filename: str):
+def delete(filename: str, current_user: dict = Depends(get_current_user)):
+    safe_join(DOCS_DIR, filename)
     result = delete_file(filename)
     return {
         "msg": result
@@ -254,13 +281,34 @@ def delete(filename: str):
 # ==========================
 
 @app.post("/api/upload")
-async def upload(file: UploadFile):
-    path = os.path.join(DOCS_DIR, file.filename)
+async def upload(file: UploadFile = File(...), current_user: dict = Depends(get_current_user)):
+    ext = os.path.splitext(file.filename or "")[1].lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"不支持的文件类型 {ext or '(无扩展名)'}，仅允许: {', '.join(sorted(ALLOWED_EXTENSIONS))}"
+        )
+
+    path = safe_join(DOCS_DIR, file.filename)
     os.makedirs(DOCS_DIR, exist_ok=True)
-    
-    with open(path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
-    
+
+    # 流式写入并统计大小，超过 50MB 即中止并清理残留文件
+    written = 0
+    try:
+        with open(path, "wb") as f:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > MAX_UPLOAD_SIZE:
+                    raise HTTPException(status_code=413, detail="文件超过 50MB 大小限制")
+                f.write(chunk)
+    except Exception:
+        if os.path.exists(path):
+            os.remove(path)
+        raise
+
     return {
         "msg": "上传成功"
     }
@@ -271,7 +319,7 @@ async def upload(file: UploadFile):
 # ==========================
 
 @app.get("/api/chunks")
-def get_chunks(source: str = None):
+def get_chunks(source: str = None, current_user: dict = Depends(get_current_user)):
     """获取 Chunk 信息，按文档分组；可选 source 参数只返回指定文档"""
     from core.vector_store import list_chunks_grouped_by_source
 
@@ -300,7 +348,7 @@ def get_chunks(source: str = None):
 # ==========================
 
 @app.get("/api/system")
-def system_info():
+def system_info(current_user: dict = Depends(get_current_user)):
     return get_system_info()
 
 
@@ -309,7 +357,7 @@ def system_info():
 # ==========================
 
 @app.get("/api/dashboard")
-def dashboard():
+def dashboard(current_user: dict = Depends(get_current_user)):
     docs_dir = os.path.join(
         os.path.dirname(os.path.dirname(__file__)),
         "data",
@@ -319,20 +367,13 @@ def dashboard():
     file_count = 0
 
     if os.path.exists(docs_dir):
-        file_count = len(os.listdir(docs_dir))
+        file_count = len([
+            f for f in os.listdir(docs_dir)
+            if os.path.isfile(os.path.join(docs_dir, f))
+        ])
 
-    chunk_count = 0
-
-    chunk_path = os.path.join(
-        os.path.dirname(os.path.dirname(__file__)),
-        "vector_db",
-        "chunk_info.txt"
-    )
-
-    if os.path.exists(chunk_path):
-        with open(chunk_path, "r", encoding="utf-8") as f:
-            text = f.read()
-            chunk_count = text.count("Chunk")
+    # 使用 chunk_info 的真实解析结果统计，而非文本计数
+    chunk_count = len(parse_chunk_info_file())
 
     vector_db_path = os.path.join(
         os.path.dirname(os.path.dirname(__file__)),
@@ -344,7 +385,7 @@ def dashboard():
         "files": file_count,
         "chunks": chunk_count,
         "model": "ChatGLM3-6B",
-        "embedding": "BGE-large-zh",
+        "embedding": EMBEDDING_MODEL_NAME,
         "vector_db": os.path.exists(vector_db_path)
     }
 
@@ -354,7 +395,7 @@ def dashboard():
 # ==========================
 
 @app.get("/api/dashboard-detail")
-def dashboard_detail():
+def dashboard_detail(current_user: dict = Depends(get_current_user)):
     docs_dir = os.path.join(
         os.path.dirname(os.path.dirname(__file__)),
         "data",

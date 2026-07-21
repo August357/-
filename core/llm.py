@@ -1,18 +1,20 @@
 import gc
 import os
-import sys
 import threading
 
 os.environ["HF_HUB_DISABLE_SYMLINKS"] = "true"
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
+_IMPORT_ERROR = None
 try:
     from transformers import AutoModel, AutoTokenizer, BitsAndBytesConfig
     import torch
 except ImportError as e:
-    print(f"导入依赖失败: {e}")
-    print("请运行: pip install transformers torch bitsandbytes accelerate")
-    sys.exit(1)
+    # 依赖缺失时不终止进程（服务仍需提供 /api/health 等接口），
+    # 在 load_model() 时统一抛出带提示的异常
+    _IMPORT_ERROR = e
+    AutoModel = AutoTokenizer = BitsAndBytesConfig = None
+    torch = None
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -38,6 +40,12 @@ def load_model():
     with _lock:
         if _model is not None:
             return _model, _tokenizer
+
+        if _IMPORT_ERROR is not None:
+            raise RuntimeError(
+                f"LLM 依赖导入失败: {_IMPORT_ERROR}。"
+                "请运行: pip install transformers torch bitsandbytes accelerate"
+            ) from _IMPORT_ERROR
 
         print("首次加载模型...")
 
